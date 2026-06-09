@@ -25,8 +25,7 @@ export default withMermaid(defineConfig({
             { text: 'AI 与 Agent 工程篇', link: '/prep/ai-agent' },
             { text: 'Java 后端与基建篇', link: '/prep/java-backend' },
             { text: '核心项目深挖篇', link: '/prep/projects' },
-            { text: '高阶系统设计篇', link: '/prep/system-design' },
-            { text: '示例：算法与数据结构', link: '/prep/algorithm' }
+            { text: '高阶系统设计篇', link: '/prep/system-design' }
           ]
         }
       ],
