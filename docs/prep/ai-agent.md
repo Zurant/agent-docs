@@ -111,6 +111,8 @@ RAG（Retrieval-Augmented Generation）是解决大语言模型“缺乏最新�
   - **固定长度切分 (Fixed-size chunking)**：按字符数切，简单粗暴，容易截断关键语句。
   - **按标点符号切分 (Recursive Splitting)**：优先按段落、句号切，保证语义完整性。
   - **语义切分 (Semantic Chunking)**：利用小模型判断句子间的连贯性动态切分。
+  - **结构化切块 (Structured Chunking / Document-based Chunking)**：针对 Markdown、HTML、PDF 等具有明显层级结构的文档，基于其自带的标题（H1/H2）、段落标签、表格等天然边界进行切块，能够最大程度保留原文档的逻辑脉络与排版信息。
+  - **父子切块 (Parent-Child Chunking / Auto-merging Retriever)**：将文档进行层级切分（大块作为 Parent，小块作为 Child）。向量检索时基于细粒度的 Child 块进行精准匹配；当检索命中的 Child 块达到一定比例或阈值时，直接将关联的整个 Parent 块拼装后送给大模型。这种机制完美兼顾了检索时的“高精度匹配”与最终生成时的“全局上下文连贯”。
 - **代码场景的特殊切分（基于 AST）**：对于代码或日志报错堆栈，常规文本切分会破坏代码逻辑结构。此时需要使用解析器（如 JavaParser）将代码按 Method（方法）、Class（类）为边界进行精准提取，保证输入给 LLM 的 Context 在逻辑上是闭环的。
 
 ### 2.3 召回 (Retrieval) 与重排 (Rerank) 优化方案
