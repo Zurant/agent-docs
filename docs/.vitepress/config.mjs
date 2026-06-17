@@ -22,7 +22,15 @@ export default withMermaid(defineConfig({
           text: '面试准备体系',
           items: [
             { text: '概览', link: '/prep/' },
-            { text: 'AI 与 Agent 工程篇', link: '/prep/ai-agent' },
+            {
+              text: 'AI 与 Agent 工程篇',
+              items: [
+                { text: '综合与概览', link: '/prep/ai-agent' },
+                { text: 'Prompt 工程', link: '/prep/prompt-engineering' },
+                { text: 'Context 工程', link: '/prep/context-engineering' },
+                { text: 'Harness 工程', link: '/prep/harness-engineering' }
+              ]
+            },
             { text: 'Java 后端与基建篇', link: '/prep/java-backend' },
             { text: '核心项目深挖篇', link: '/prep/projects' },
             { text: '高阶系统设计篇', link: '/prep/system-design' }
