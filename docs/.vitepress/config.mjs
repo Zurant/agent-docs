@@ -30,7 +30,13 @@ export default withMermaid(defineConfig({
               ]
             },
             { text: 'Java 后端与基建篇', link: '/prep/java-backend' },
-            { text: '核心项目深挖篇', link: '/prep/projects' },
+            {
+              text: '项目深挖与准备',
+              items: [
+                { text: '核心项目概览', link: '/prep/projects' },
+                { text: 'Log-Sentinel-AI 深度解析', link: '/prep/log-sentinel-ai-deep-dive' }
+              ]
+            },
             { text: '高阶系统设计篇', link: '/prep/system-design' }
           ]
         }
