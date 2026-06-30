@@ -1,6 +1,6 @@
 # Log-Sentinel-AI 项目架构与核心技术深挖
 
-本文档用于梳理 `log-sentinel-ai` 的项目架构与核心实现，重点覆盖诊断主链路、Milvus RAG、reranker、召回精度评估、LLM 工具调用和工程化降级策略，可用于技术评审、面试讲解和优化参考。
+本文档用于梳理 `log-sentinel-ai` 的项目架构与核心实现，重点覆盖诊断主链路、Milvus RAG、reranker、召回精度评估、LLM 工具调用、Qwen LoRA 垂类微调和工程化降级策略，可用于技术评审、面试讲解和优化参考。
 
 ---
 
@@ -52,6 +52,177 @@ sentinel.ai.provider: ${AI_PROVIDER:cloud}
 - `local`：使用本地 Ollama chat model。
 
 代码中的配置前缀和变量名保留了 `google.ai-gemini`、`geminiBaseUrl`、`geminiModelName` 命名，但实际通过 OpenAI-compatible 代理访问 `deepseek-v4-flash`。
+
+### 2.1 Qwen LoRA 垂类微调
+
+项目针对本地 Qwen 指令模型做过一次日志诊断垂类 LoRA 微调。微调目标不是让模型记住所有历史故障，也不是替代 RAG、源码工具或结构化解析校验，而是解决长上下文日志诊断中更具体的工程问题：当 prompt 同时包含异常堆栈、RAG 历史案例、源码上下文和输出格式约束时，通用指令模型容易出现输出格式漂移，例如混入 Markdown 解释、遗漏必需字段、严重级别枚举不稳定、`traceId` 与输入不一致，或者为了满足格式说明牺牲根因分析内容。
+
+因此这次微调的核心目标是提升模型的 schema following 和 SOP following 能力，让模型默认按项目内部诊断报告格式输出，而不是每次都依赖很长的 System Prompt 反复约束。
+
+#### 2.1.1 为什么需要微调
+
+在日志诊断场景中，输入通常不是短问答，而是多源上下文拼接后的长文本：
+
+- 原始 Java 异常堆栈，可能包含多层 `Caused by`、框架栈和业务栈。
+- RAG 召回的历史相似案例。
+- GitLab 源码工具返回的方法级源码片段。
+- 当前服务名、traceId、commitId、环境和诊断要求。
+
+通用 Qwen 指令模型在短输入下可以较好遵循 JSON 输出，但在长上下文下更容易被异常堆栈、历史案例文本或源码注释干扰，典型问题包括：
+
+1. 输出前后出现解释性自然语言，导致 JSON parser 解析失败。
+2. `severityLevel` 输出为 `严重`、`P1`、`中等` 等非项目枚举。
+3. `relatedFiles` 引用历史案例里的类名，而不是当前异常栈或源码中的类名。
+4. `traceId` 使用历史案例 traceId，或被模型重新生成。
+5. 修复建议过于模板化，没有贴合内部 SOP 中“根因、影响面、修复动作、验证方式”的表达习惯。
+
+Prompt 工程可以缓解这些问题，但会带来两个副作用：一是 System Prompt 越写越长，推理 token 成本上升；二是格式约束越多，模型留给根因分析的注意力越少。LoRA 微调的价值在于把稳定输出格式和内部表达习惯内化为模型行为，使 prompt 可以更聚焦于当前故障事实。
+
+#### 2.1.2 训练数据设计
+
+训练数据来自脱敏后的排障样本，按 Alpaca JSONL 格式组织，每条样本包含：
+
+- `instruction`：固定任务说明，要求模型扮演 Java 微服务日志诊断专家，并只输出合法 JSON。
+- `input`：服务名、TraceID、异常堆栈、RAG 历史案例和源码上下文。
+- `output`：人工整理或复核后的内部 SOP JSON 诊断报告。
+
+样本结构示例：
+
+```json
+{
+  "instruction": "You are a Java microservice log diagnosis expert. Based on the service name, trace ID, error stack, RAG historical cases, and source-code context, output only a valid JSON diagnosis report that follows the internal SOP schema.",
+  "input": "ServiceName: vs-player\nTraceID: trace-train-0001\nErrorStack:\n...\nHistoricalCases:\n...\nSourceContext:\n...",
+  "output": "{\"traceId\":\"trace-train-0001\",\"rootCause\":\"...\",\"severityLevel\":\"HIGH\",\"fixSuggestion\":\"...\",\"relatedFiles\":[\"com.vs.player.service.PlayerServiceImpl\"]}"
+}
+```
+
+输出字段固定为：
+
+| 字段 | 说明 |
+| --- | --- |
+| `traceId` | 必须与输入 TraceID 一致，防止历史案例 traceId 串入当前报告 |
+| `rootCause` | 说明真实失败链路，不能只复述异常类型 |
+| `severityLevel` | 只能取 `LOW`、`MEDIUM`、`HIGH`、`CRITICAL` |
+| `fixSuggestion` | 给出可执行修复建议，包含参数校验、配置修复、代码修改或回滚建议 |
+| `relatedFiles` | 只允许引用当前堆栈、源码上下文或服务模块中出现的类 |
+
+脱敏时保留诊断必要信号，例如异常类型、类名、方法名、行号、服务名和错误码；替换用户 ID、手机号、邮箱、token、真实 IP、内部域名和敏感业务参数。这样既能保护数据，又不会破坏模型学习故障模式和输出风格所需的结构信息。
+
+#### 2.1.3 微调参数与设计依据
+
+微调使用 LLaMA-Factory 做 LoRA SFT，配置文件位于 `configs/llamafactory/qwen_log_sentinel_lora.yaml`。核心参数如下：
+
+```yaml
+model_name_or_path: Qwen/Qwen2.5-7B-Instruct
+stage: sft
+finetuning_type: lora
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+num_train_epochs: 3
+learning_rate: 0.0001
+cutoff_len: 8192
+template: qwen
+packing: false
+```
+
+参数设计理由如下：
+
+| 参数 | 选择 | 原因 |
+| --- | --- | --- |
+| 基座模型 | Qwen 7B-9B instruct class | 本地可部署成本可控，中文和代码理解能力较好，适合私有化日志诊断场景 |
+| `finetuning_type` | `lora` | 训练成本低，适合做格式和领域风格对齐，也便于回滚或多版本切换 |
+| `lora_rank` | `8` | 微调目标偏格式/SOP 对齐，不需要大规模知识注入；rank 太高更容易过拟合小样本 |
+| `lora_alpha` | `16` | 与 rank 保持常见 2 倍比例，保证适配器更新强度适中 |
+| `lora_dropout` | `0.05` | 降低小数据集过拟合风险，保留基座模型通用能力 |
+| `num_train_epochs` | `3` | 让模型充分学习输出格式，同时避免重复样本导致诊断表达固化 |
+| `learning_rate` | `1e-4` | LoRA SFT 常用保守学习率，减少对原模型能力的破坏 |
+| `cutoff_len` | `8192` | 覆盖异常堆栈、RAG 案例和源码片段的组合输入，贴近真实推理长度 |
+| `packing` | `false` | 每条诊断样本保持独立，避免多条故障上下文拼接后造成 traceId 和输出边界混淆 |
+
+这组参数的取舍重点是“低侵入、可回滚、优先稳定格式”。如果后续训练集扩大到几千到上万条，并且包含更复杂的故障分类，可以再考虑提高 rank 或调整 epoch；但在当前目标下，rank=8、epoch=3 是更稳妥的起点。
+
+#### 2.1.4 评估方式与对照实验
+
+微调是否有效不能只看训练 loss，也不能只看单条样例是否输出正确。项目采用 held-out 测试集做对照评估，测试样本不参与训练，并覆盖空指针、参数非法、超时、数据库异常、配置缺失、跨服务调用失败等常见线上故障类型。
+
+对照实验分三组：
+
+1. Base Qwen + 严格 System Prompt。
+2. Base Qwen + RAG + 严格 System Prompt。
+3. LoRA Qwen + RAG + 简化 System Prompt。
+
+评估分为自动指标和人工复核两层。自动指标由 `scripts/finetune/evaluate_format_stability.py` 统计：
+
+| 指标 | 含义 | 有效性判断 |
+| --- | --- | --- |
+| `jsonValidRate` | 输出能否被 JSON parser 解析 | LoRA 组应明显高于 Base 组 |
+| `sopFieldCompleteRate` | 必需字段是否完整 | LoRA 组应接近稳定满分 |
+| `severityEnumValidRate` | 严重级别是否为合法枚举 | LoRA 组应避免中文、P0/P1 等非项目枚举 |
+| `traceConsistencyRate` | 输出 traceId 是否与输入一致 | LoRA 组应避免串用 RAG 历史 traceId |
+| `relatedFileHallucinationRate` | 是否引用不存在的类或文件 | LoRA 组不应高于 Base + RAG 组 |
+| `avgOutputChars` | 平均输出长度 | 简化 Prompt 后输出仍应保持结构完整 |
+
+人工复核重点看两项：
+
+- `Root Cause Acceptable Rate`：根因是否和异常链路、业务栈帧、源码上下文一致。
+- `Fix Suggestion Actionable Rate`：修复建议是否能被工程师直接执行或验证。
+
+只有当 LoRA 组在格式类指标上提升，同时根因可接受率和修复建议可执行率不下降，才认为微调有效。如果只是 JSON 更稳定，但根因分析变差，说明模型过拟合了格式，不适合进入主链路。
+
+评估命令示例：
+
+```bash
+python3 scripts/finetune/evaluate_format_stability.py \
+  --predictions data/finetune/predictions_sample.jsonl
+```
+
+输出示例：
+
+```json
+{
+  "total": 1,
+  "jsonValidRate": 1.0,
+  "sopFieldCompleteRate": 1.0,
+  "severityEnumValidRate": 1.0,
+  "traceConsistencyRate": 1.0,
+  "relatedFileHallucinationRate": 0.0,
+  "avgOutputChars": 227.0
+}
+```
+
+#### 2.1.5 微调后的收益与边界
+
+微调后的收益主要体现在三个方面：
+
+1. 输出格式更稳定，减少 JSON 解析失败和字段缺失导致的重试。
+2. System Prompt 可以从大量格式约束中释放出来，更多描述诊断任务本身，降低部分推理 token 开销。
+3. 诊断报告更贴近内部 SOP，根因和修复建议表达更统一，便于 Dashboard 展示、企微告警和后续知识入库。
+
+但微调不是事实来源，也不能替代工程链路。生产中仍然需要保留：
+
+- RAG 历史案例召回，用于提供可追溯经验。
+- GitLab 源码工具调用，用于提供当前版本代码事实。
+- JSON parser 校验和失败重试，用于兜底模型输出异常。
+- `relatedFiles`、`traceId`、`severityLevel` 等字段的后置校验。
+- 人工反馈和知识生命周期治理，避免错误诊断沉淀进 Milvus。
+
+更准确的定位是：LoRA 微调提升的是“模型默认按项目诊断 SOP 输出”的概率，RAG 和工具调用负责提供事实依据，工程校验负责保证系统可靠性。
+
+#### 2.1.6 相关支撑文件
+
+项目中保留了微调相关材料，便于后续复现实验和扩充数据：
+
+| 文件 | 作用 |
+| --- | --- |
+| `docs/finetune/qwen-lora-finetune.md` | Qwen LoRA 微调方案，说明目标、数据来源、脱敏、训练方式、评估指标和生产接入边界 |
+| `docs/finetune/alpaca-format.md` | Alpaca JSONL 数据格式说明，定义 `instruction`、`input`、`output` 结构和数据质量规则 |
+| `docs/finetune/eval-report-template.md` | 格式稳定性评估报告模板，用于记录 base model、RAG、LoRA 三组对照实验结果 |
+| `data/finetune/alpaca_sample.jsonl` | 脱敏后的样例训练数据，模拟 Java 微服务异常诊断样本 |
+| `data/finetune/predictions_sample.jsonl` | 样例推理输出，用于验证评估脚本 |
+| `configs/llamafactory/qwen_log_sentinel_lora.yaml` | LLaMA-Factory LoRA SFT 训练配置 |
+| `scripts/finetune/convert_diagnosis_to_alpaca.py` | 将诊断记录 JSONL 转换为 Alpaca JSONL 的工具脚本 |
+| `scripts/finetune/evaluate_format_stability.py` | 对模型输出做 JSON 合法性、字段完整性、枚举合法性和 TraceID 一致性评估 |
 
 ---
 
@@ -610,6 +781,47 @@ DiagnosisKnowledgeBase.searchSimilarCases(serviceName, errorStack, topK, minScor
 
 并输出 TopK、Recall@K、MRR 和负样本误召回。
 
+### 9.6 诊断置信度评分
+
+每次诊断成功后，`DiagnosisConfidenceScorer` 会用确定性规则给报告打出 `0-100` 的置信度分数，并把依据与风险提示写回 `DiagnosisReport` 和 MySQL `diagnostic_request_record`。
+
+评分公式如下：
+
+- 基础分 `40`。
+- RAG 命中历史案例加 `18`，否则记录未命中风险。
+- 有源码上下文加 `16`，否则记录缺少源码上下文风险。
+- 堆栈包含 `Caused by:` 加 `10`，否则提示异常链不完整。
+- 堆栈包含 `com.vs` 或 `com.sentinel` 业务帧加 `10`，否则提示缺少业务栈帧。
+- 根因和修复建议完整加 `6`，否则扣 `10` 并提示诊断信息不完整。
+
+最终分数会 clamp 到 `[0,100]`。Dashboard 最近诊断流水会展示该分数，方便人工快速判断诊断可信度。
+
+### 9.7 反馈审计与知识生命周期
+
+用户反馈会持久化到 MySQL `diagnosis_feedback_record`，字段包含 `trace_id`、`action`、`user_id`、`remark` 和 `created_at`。这张表是诊断反馈的审计轨迹，即使向量库更新失败，也能保留人工治理记录。
+
+Milvus 知识 metadata 增加生命周期与反馈计数字段：
+
+- `lifecycleStatus`: `ACTIVE`、`INVALID`、`OUTDATED`。
+- `feedbackScore`: 正向反馈加分，负向反馈扣分。
+- `positiveFeedbackCount`: 采纳或确认准确次数。
+- `negativeFeedbackCount`: 误判或过期次数。
+
+新入库知识默认是 `ACTIVE`，反馈分与计数均为 `0`。`ACCURATE` 会保持知识启用并增加正向反馈；`INACCURATE` 会标记为 `INVALID`；`OUTDATED` 会标记为 `OUTDATED`。
+
+### 9.8 知识治理与 RAG 过滤
+
+RAG 检索会在 Milvus 返回候选后过滤 inactive 知识：`INVALID` 和 `OUTDATED` 不再进入 rerank，也不会提供给诊断 Agent。缺少 lifecycle metadata 的旧数据按 `ACTIVE` 处理，保证兼容历史向量。
+
+Dashboard 提供 `/api/v1/dashboard/knowledge/govern` 治理接口，支持：
+
+- `ENABLE`: 重新启用知识。
+- `MARK_INVALID`: 标记误判。
+- `MARK_OUTDATED`: 标记过期。
+- `DELETE`: 物理删除知识。
+
+LangChain4j 的通用 `EmbeddingStore` 没有稳定的 metadata in-place update API，因此生命周期更新采用“按 traceId 查找、删除旧向量、用更新后的 metadata 重加”的方式。若查找或 embedding 失败，系统会记录日志并保留 MySQL 反馈审计，不阻断主诊断链路。
+
 ---
 
 ## 10. 技术亮点
@@ -627,6 +839,9 @@ DiagnosisKnowledgeBase.searchSimilarCases(serviceName, errorStack, topK, minScor
 11. 企微告警对大模型缺字段做兜底，降低结构化输出波动对告警链路的影响。
 12. Milvus、embedding、reranker 均有降级策略，避免 AI 基础设施异常阻断主诊断链路。
 13. 知识入库按严重级别和 stackHash 去重过滤，降低低价值样本与重复样本污染知识库的风险。
+14. 诊断报告增加确定性置信度评分，记录评分依据和风险提示，便于人工审阅。
+15. 反馈审计落 MySQL，知识生命周期落 Milvus metadata，支持误判和过期知识从 RAG 中退出。
+16. 完成 Qwen LoRA 垂类微调设计，围绕长上下文日志诊断下的 JSON/SOP 输出稳定性，明确了 Alpaca 数据格式、LLaMA-Factory 参数、base/RAG/LoRA 对照实验和自动化评估指标。
 
 ---
 
@@ -637,6 +852,7 @@ DiagnosisKnowledgeBase.searchSimilarCases(serviceName, errorStack, topK, minScor
 3. 将 `findSimilarCases()` 的 rerank 开关、TopK、minScore 参数配置化，避免写死在代码里。
 4. 优化 `LocalInfinityScoringModel` 的失败返回语义，例如直接抛出可识别异常或返回 `Optional`，进一步区分“真实低相关”和“服务调用失败”。
 5. 为 Dashboard 增加基于 metadata 的精确查询接口，区分“展示搜索”和“评估搜索”。
-6. 为历史知识增加人工反馈状态，例如有效、误判、过期，避免低质量诊断反哺到知识库。
+6. 为历史知识增加更细粒度的审核工作流，例如待复核、双人确认和批量恢复。
 7. 将跨服务 fallback 做成可配置策略，例如关闭、同业务域 fallback、全局 fallback 三档。
 8. 增加 RAG 评估 CI 或定时任务，防止特征提取、清洗规则或模型替换后召回质量回退。
+9. 扩充真实脱敏排障样本，补齐 LoRA 微调的训练集、验证集和 held-out 测试集，并形成可复现的 base/RAG/LoRA 对照评估报告。
