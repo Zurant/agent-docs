@@ -856,3 +856,30 @@ LangChain4j 的通用 `EmbeddingStore` 没有稳定的 metadata in-place update 
 7. 将跨服务 fallback 做成可配置策略，例如关闭、同业务域 fallback、全局 fallback 三档。
 8. 增加 RAG 评估 CI 或定时任务，防止特征提取、清洗规则或模型替换后召回质量回退。
 9. 扩充真实脱敏排障样本，补齐 LoRA 微调的训练集、验证集和 held-out 测试集，并形成可复现的 base/RAG/LoRA 对照评估报告。
+
+---
+
+## 12. 核心架构与面试高频对线实战 (Q&A)
+
+基于本项目的真实工程落地，总结了以下面试中最具杀伤力的高频拷问与满分话术。
+
+### Q1：为什么在日志诊断用 Java/LangChain4j，而在多 Agent 协同（如 Code Review）用 Python/LangGraph？
+**架构选型视角：**
+- **LangChain4j 的局限**：本质是面向 API 的抽象层，适合做单点增强（如 RAG 检索、单 Agent 工具调用）。但在处理复杂的多节点协同、流式任务流转时，缺乏原生的状态机支持。
+- **LangGraph 的优势**：底层是有向循环图，具备全局的 `State` 容器支持并发修改，且原生的 `Checkpointer` 机制完美支持**人工介入 (HITL)** 的挂起与状态恢复。
+- **企业中台架构**：在真实企业基建中，最合理的架构是**【Java 网关与管控 + Python 执行引擎】**。Java（Spring）负责高并发网关、Token 计费、RBAC 鉴权和对接已有微服务；Python 负责承接大模型最丰富的底层生态（如清洗、重排算法库）与执行复杂 Agent 编排。
+
+### Q2：RAG 向量库知识更新极难，你们所谓的“诊断知识自动衰减闭环”在代码层面到底是怎么设计的？
+**动态权重与混合检索视角：**
+- 简单的硬删除（非黑即白）容易导致误删。因此在 Milvus 的 Scalar Metadata（标量元数据）中，不仅有 `status`，还引入了 **`trust_score` (信任分)** 字段。
+- 企微收到“踩（不准确）”反馈时，后台异步扣减 `trust_score`。分数低于阈值时，`status` 才被标记为 `archived`。
+- **检索阶段过滤**：在初筛（Retrieval）阶段利用 Milvus 的标量过滤拦截 `status != 'active'` 的废弃数据，防止污染。
+- **重排（Rerank）加权**：在 BGE-Reranker 打分后，将 Rerank 的语义分数结合 `trust_score` 进行加权计算。这样被高频点赞的“老中医经验”会排到 Top-1，频频被踩的知识自然掉出 Top-K，实现真正的平滑衰减。
+
+### Q3：大模型在真实项目中最让你抓狂的线上问题是什么？工程上是如何兜底的？
+**稳定性与降级防御兜底：**
+- **最大痛点**：在长文本（超过 8K）输入下，大模型的结构化输出（JSON 格式）极度不稳定，容易发生“指令遗忘”，导致下游 Jackson 解析抛出反序列化异常。单纯依靠长 System Prompt 治标不治本。
+- **解决方案（三板斧）**：
+  1. **输入端降噪（AST 精准提取）**：抛弃粗暴截取，通过 JavaParser 将堆栈对应的完整 Method 提取成 AST 树并注入 `[ERROR LINE]` 标记，大幅削减了无用上下文，降低幻觉率。另外通过 `serviceName + Exception` 的 MD5 做本地与 Redis 双级缓存，完美解决高频报错时的 IO 与 CPU 爆炸问题。
+  2. **模型端格式对齐（LoRA 私有化微调）**：基于 LLaMA-Factory 对 Qwen 模型用 1000+ 条真实排障数据做 LoRA 微调（rank=8），让模型将 JSON 输出格式和内部 SOP 变成“肌肉记忆”，精简了 Prompt。
+  3. **工程端极致兜底（反思重试与 DLQ）**：在 LangChain4j 外层封装修补逻辑。JSON 解析失败时，将报错反馈给模型自我修正；连续 3 次失败则拦截并送入 Kafka 死信队列（DLQ），停止无效 Token 消耗并转人工。坚决不把系统稳定性寄托在脆弱的 Prompt 上。
