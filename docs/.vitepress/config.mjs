@@ -30,6 +30,7 @@ export default withMermaid(defineConfig({
               ]
             },
             { text: 'Java 后端与基建篇', link: '/prep/java-backend' },
+            { text: 'JVM 与线上问题排查 (重点)', link: '/prep/jvm-troubleshooting' },
             {
               text: '项目深挖与准备',
               items: [
@@ -46,7 +47,7 @@ export default withMermaid(defineConfig({
           text: '过程复盘',
           items: [
             { text: '概览', link: '/retrospectives/' },
-            { text: '公司A - 面经', link: '/retrospectives/company-a' }
+            { text: '爱商在线 0706下午1:30', link: '/retrospectives/aishang-online-0706' }
           ]
         }
       ]
